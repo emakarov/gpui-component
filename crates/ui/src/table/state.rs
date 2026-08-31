@@ -486,33 +486,22 @@ where
     /// });
     /// ```
     pub fn set_selected_cell(&mut self, row_ix: usize, col_ix: usize, cx: &mut Context<Self>) {
-        self.set_selected_cell_with_scroll(row_ix, col_ix, true, cx);
-    }
-
-    /// [`Self::set_selected_cell`], with the scroll made optional.
-    ///
-    /// A mouse click can only land on a cell the user can already see, so
-    /// forcing it to the centre of the viewport moves content out from under
-    /// the pointer for no reason — `on_cell_click` selects with `scroll:
-    /// false` for exactly that case. Keyboard and programmatic selection
-    /// keep `scroll: true`, since either can land on a cell that is off
-    /// screen.
-    fn set_selected_cell_with_scroll(
-        &mut self,
-        row_ix: usize,
-        col_ix: usize,
-        scroll: bool,
-        cx: &mut Context<Self>,
-    ) {
         self.selection_mode = SelectionMode::Cell;
         self.selected_cell = Some((row_ix, col_ix));
 
-        if scroll {
-            // Scroll to the cell
-            self.vertical_scroll_handle
-                .scroll_to_item(row_ix, ScrollStrategy::Center);
-            self.scroll_to_col(col_ix, cx);
-        }
+        // `Nearest`, not `Center`: gpui's own `scroll_to_item` already skips
+        // scrolling a fully visible row (`scroll_strict: false` gates the
+        // whole match on `is_above || is_below`), so `Center` only ever
+        // fired for a row *partly* clipped at an edge -- and recentring the
+        // whole table for a partial clip is still wrong, just for a
+        // narrower case than "every click" first suggested. `Nearest` does
+        // the minimal reveal that case actually wants: nothing when the row
+        // is visible, no more than needed when it is not. Also fixes
+        // keyboard navigation, which shares this method and does not need
+        // its own opt-out.
+        self.vertical_scroll_handle
+            .scroll_to_item(row_ix, ScrollStrategy::Nearest);
+        self.scroll_to_col(col_ix, cx);
 
         cx.emit(TableEvent::SelectCell(row_ix, col_ix));
         cx.notify();
@@ -746,8 +735,7 @@ where
             return;
         }
 
-        // `scroll: false` -- see `set_selected_cell_with_scroll`'s own note.
-        self.set_selected_cell_with_scroll(row_ix, col_ix, false, cx);
+        self.set_selected_cell(row_ix, col_ix, cx);
 
         if is_double_click {
             cx.emit(TableEvent::DoubleClickedCell(row_ix, col_ix));
