@@ -1686,6 +1686,17 @@ where
                     .test_support()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.on_col_head_click(col_ix, window, cx);
+                        // Sorting a column was previously reachable only by
+                        // clicking `render_sort_icon`'s own small icon --
+                        // `unsorted_icon(false)` hides that icon entirely
+                        // for an unsorted column, which removed the only
+                        // way to ever START sorting one (an already-sorted
+                        // column still had its real arrow to click). Both
+                        // `perform_sort` and `on_col_head_click` self-gate
+                        // (no-op on a non-sortable/non-selectable column),
+                        // so calling both from the same click is safe
+                        // regardless of `unsorted_icon`'s setting.
+                        this.perform_sort(col_ix, window, cx);
                     }))
                     .child(
                         h_flex()
