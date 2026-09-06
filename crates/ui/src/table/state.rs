@@ -1490,7 +1490,13 @@ where
                                     self.options.size.table_cell_padding().right - paddings.right;
                                 this.pr(offset_pr.max(px(0.)))
                             })
-                            .children(self.render_sort_icon(col_ix, &col_group, window, cx)),
+                            .children(self.render_sort_icon(col_ix, &col_group, window, cx))
+                            // After the sort icon, not before -- see
+                            // `TableDelegate::render_th_trailing`'s own doc
+                            // comment for why this exists as a separate hook
+                            // rather than something a delegate puts inside
+                            // its own `render_th`.
+                            .child(self.delegate.render_th_trailing(col_ix, window, cx)),
                     )
                     .when(movable, |this| {
                         this.on_drag(
