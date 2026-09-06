@@ -246,6 +246,15 @@ pub struct TableState<D: TableDelegate> {
     pub row_header: bool,
     /// Whether the table can sort.
     pub sortable: bool,
+    /// Whether an unsorted-but-sortable column still draws a faint
+    /// "chevrons up-down" icon inviting a click. Defaults to `true`
+    /// (existing behavior, unchanged). Set to `false` to match a common
+    /// alternative convention (e.g. AG Grid's own `unSortIcon: false`
+    /// default): no icon at all until a column becomes the active sort,
+    /// at which point the real ascending/descending arrow appears. Either
+    /// way, clicking the column header still sorts it -- this only
+    /// changes whether the invitation is drawn before that first click.
+    pub unsorted_icon: bool,
     /// Whether the table can resize columns.
     pub col_resizable: bool,
     /// Whether the table can move columns.
@@ -309,6 +318,7 @@ where
             cell_selectable: false,
             row_header: true,
             sortable: true,
+            unsorted_icon: true,
             col_movable: true,
             col_resizable: true,
             col_fixed: true,
@@ -351,6 +361,15 @@ where
     /// Set to enable/disable column sortable, default true
     pub fn sortable(mut self, sortable: bool) -> Self {
         self.sortable = sortable;
+        self
+    }
+
+    /// Set to `false` to draw no icon at all on a sortable-but-not-currently-
+    /// sorted column header, showing the real ascending/descending arrow only
+    /// once that column becomes the active sort. Default `true` (existing
+    /// behavior: a faint "chevrons up-down" invites the click).
+    pub fn unsorted_icon(mut self, unsorted_icon: bool) -> Self {
+        self.unsorted_icon = unsorted_icon;
         self
     }
 
@@ -1612,11 +1631,18 @@ where
             return None;
         };
 
-        let (icon, is_on) = match sort {
-            ColumnSort::Ascending => (IconName::SortAscending, true),
-            ColumnSort::Descending => (IconName::SortDescending, true),
-            ColumnSort::Default => (IconName::ChevronsUpDown, false),
+        let icon = match sort {
+            ColumnSort::Ascending => IconName::SortAscending,
+            ColumnSort::Descending => IconName::SortDescending,
+            // Sortable, but not the active sort: draw the faint invitation
+            // icon only if the caller still wants one (`unsorted_icon`,
+            // default `true`, matches the behavior this arm always had
+            // before that field existed). `unsorted_icon: false` skips this
+            // arm entirely -- no icon until the column IS the active sort.
+            ColumnSort::Default if !self.unsorted_icon => return None,
+            ColumnSort::Default => IconName::ChevronsUpDown,
         };
+        let is_on = !matches!(sort, ColumnSort::Default);
 
         Some(
             div()
