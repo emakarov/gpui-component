@@ -85,6 +85,23 @@ pub trait TableDelegate: Sized + 'static {
             .child(self.column(col_ix, cx).name.clone())
     }
 
+    /// Render extra header-cell content for the given column, positioned
+    /// AFTER the built-in sort icon (which itself renders after whatever
+    /// `render_th` returns) -- so a delegate wanting `[name] [sort icon]
+    /// [something]` puts the "something" here instead of inside `render_th`,
+    /// where it would end up BEFORE the sort icon. Default: nothing (an
+    /// empty element), which is what every existing delegate already draws
+    /// today, so overriding this is opt-in and changes no existing table's
+    /// layout.
+    fn render_th_trailing(
+        &mut self,
+        col_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        div()
+    }
+
     /// Render the row at the given row and column.
     ///
     /// Not include the table head row.
