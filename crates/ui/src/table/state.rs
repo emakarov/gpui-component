@@ -184,6 +184,8 @@ pub struct TableState<D: TableDelegate> {
     bounds: Bounds<Pixels>,
     /// The bounds of the fixed head cols.
     fixed_head_cols_bounds: Bounds<Pixels>,
+    /// The bounds of the right fixed head cols.
+    fixed_right_head_cols_bounds: Bounds<Pixels>,
 
     col_groups: Vec<ColGroup>,
     header_layout: Vec<Vec<HeaderCell>>,
@@ -281,6 +283,7 @@ where
             col_drag_gap: None,
             bounds: Bounds::default(),
             fixed_head_cols_bounds: Bounds::default(),
+            fixed_right_head_cols_bounds: Bounds::default(),
             visible_range: TableVisibleRange::default(),
             loop_selection: true,
             col_selectable: true,
@@ -406,6 +409,12 @@ where
 
     // Scroll to the column at the given index.
     pub fn scroll_to_col(&mut self, col_ix: usize, cx: &mut Context<Self>) {
+        // A right fixed column is always visible, nothing to scroll.
+        if col_ix >= self.fixed_right_start() {
+            cx.notify();
+            return;
+        }
+
         let col_ix = col_ix.saturating_sub(self.fixed_left_cols_count());
 
         self.horizontal_scroll_handle
@@ -651,6 +660,24 @@ where
             .iter()
             .filter(|col| col.column.fixed == Some(ColumnFixed::Left))
             .count()
+    }
+
+    fn fixed_right_cols_count(&self) -> usize {
+        if !self.col_fixed {
+            return 0;
+        }
+
+        self.col_groups
+            .iter()
+            .filter(|col| col.column.fixed == Some(ColumnFixed::Right))
+            .count()
+    }
+
+    /// The index of the first right fixed column, which is also the end of
+    /// the scrollable columns. Equals the columns count without right fixed
+    /// columns.
+    fn fixed_right_start(&self) -> usize {
+        fixed_right_start(self.col_groups.len(), self.fixed_right_cols_count())
     }
 
     fn page_item_count(&self) -> usize {
@@ -1177,15 +1204,26 @@ where
     /// dragged column at `drag_col_ix`.
     fn drag_gap_at(&self, x: Pixels, drag_col_ix: usize) -> Option<usize> {
         let fixed_count = self.fixed_left_cols_count();
+        let right_start = self.fixed_right_start();
+        let has_right = right_start < self.col_groups.len();
 
         // Columns scrolled beneath the fixed region keep stale bounds, so
         // resolve `x` against the fixed columns alone when it falls in that
         // region, and against the visible scrollable columns otherwise.
+        let in_right = has_right && x >= self.fixed_right_head_cols_bounds.left();
         let candidates = if fixed_count > 0 && x < self.fixed_head_cols_bounds.right() {
             0..fixed_count
+        } else if in_right {
+            right_start..self.col_groups.len()
         } else {
             self.calculate_visible_leaf_col_range(fixed_count).0
         };
+
+        // Right fixed columns are taken by position, so they only move
+        // among themselves.
+        if has_right && (drag_col_ix >= right_start) != in_right {
+            return None;
+        }
 
         // The gap sits after the last candidate column whose center is left of `x`.
         let mut gap = candidates.start;
@@ -1337,6 +1375,9 @@ where
         }
 
         let group_id = SharedString::from(format!("resizable-handle:{}", ix));
+        // A right fixed column grows to the left, so its handle sits on its
+        // left edge, laid over the cell (see `render_th`).
+        let on_left_edge = ix >= self.fixed_right_start();
 
         h_flex()
             .id(("resizable-handle", ix))
@@ -1345,8 +1386,13 @@ where
             .cursor_col_resize()
             .h_full()
             .w(HANDLE_SIZE)
-            .ml(-(HANDLE_SIZE))
-            .justify_end()
+            .map(|this| {
+                if on_left_edge {
+                    this.absolute().top_0().left_0().justify_start()
+                } else {
+                    this.ml(-(HANDLE_SIZE)).justify_end()
+                }
+            })
             .items_center()
             .child(
                 div()
@@ -1379,15 +1425,27 @@ where
                                 .expect("BUG: invalid col index")
                                 .clone();
 
-                            view.resize_cols(
-                                ix,
-                                e.event.position.x - HANDLE_SIZE - col_group.bounds.left(),
-                                window,
-                                cx,
-                            );
+                            if ix >= view.fixed_right_start() {
+                                // The right edge of a right fixed column
+                                // stays put while it resizes, so measure
+                                // from it; the region does not scroll.
+                                view.resize_cols(
+                                    ix,
+                                    col_group.bounds.right() - e.event.position.x,
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                view.resize_cols(
+                                    ix,
+                                    e.event.position.x - HANDLE_SIZE - col_group.bounds.left(),
+                                    window,
+                                    cx,
+                                );
 
-                            // scroll the table if the drag is near the edge
-                            view.scroll_table_by_col_resizing(e.event.position, &col_group);
+                                // scroll the table if the drag is near the edge
+                                view.scroll_table_by_col_resizing(e.event.position, &col_group);
+                            }
                         }
                     };
                 }),
@@ -1499,9 +1557,12 @@ where
         let movable = self.col_movable && col_group.column.movable;
         let paddings = col_group.column.paddings;
         let name = col_group.column.name.clone();
+        let is_fixed_right = col_ix >= self.fixed_right_start();
 
         h_flex()
             .h_full()
+            // For the absolutely positioned resize handle of a right fixed column.
+            .when(is_fixed_right, |this| this.relative())
             .child(
                 self.render_cell(None, col_ix, window, cx)
                     .id(("col-header", col_ix))
@@ -1601,49 +1662,31 @@ where
         &self,
         left_columns_count: usize,
     ) -> (Range<usize>, Pixels) {
-        let total_cols = self.col_groups.len();
+        // Right fixed columns are rendered in their own region, never in the
+        // scrollable one.
+        let scroll_end = self.fixed_right_start();
 
         if self.bounds.size.width == px(0.) {
-            return (left_columns_count..total_cols, px(0.));
+            return (left_columns_count..scroll_end, px(0.));
         }
 
-        let fixed_width = self.fixed_head_cols_bounds.size.width;
+        let fixed_width = self.fixed_head_cols_bounds.size.width
+            + if scroll_end < self.col_groups.len() {
+                self.fixed_right_head_cols_bounds.size.width
+            } else {
+                px(0.)
+            };
         let available_width = (self.bounds.size.width - fixed_width).max(px(0.));
         // The scroll handle offset is negative when scrolled right; negate it
         // to obtain a positive distance from the left edge of the scroll area.
         let scroll_x = (-self.horizontal_scroll_handle.offset().x).max(px(0.));
 
-        // Walk left-to-right through non-fixed columns to find the first one
-        // whose right edge enters the viewport. The accumulated width of the
-        // skipped columns becomes the left spacer width.
-        let mut range_start = left_columns_count;
-        let mut left_spacer = px(0.);
-        let mut cumulative = px(0.);
-        for i in left_columns_count..total_cols {
-            let right_edge = cumulative + self.col_groups[i].width;
-            if right_edge > scroll_x {
-                range_start = i;
-                left_spacer = cumulative;
-                break;
-            }
-            cumulative = right_edge;
-        }
-
-        // Continue from `range_start` (skipping already-scanned columns) to
-        // find the last column still within the viewport. The 200 px overdraw
-        // buffer prevents a visible flash when the user scrolls quickly.
-        let right_bound = scroll_x + available_width + px(200.);
-        let mut range_end = total_cols;
-        let mut cumulative = left_spacer; // already summed widths before `range_start`
-        for i in range_start..total_cols {
-            cumulative += self.col_groups[i].width;
-            if cumulative > right_bound {
-                range_end = (i + 1).min(total_cols);
-                break;
-            }
-        }
-
-        (range_start..range_end, left_spacer)
+        visible_leaf_col_range(
+            |ix| self.col_groups[ix].width,
+            left_columns_count..scroll_end,
+            scroll_x,
+            available_width,
+        )
     }
 
     fn render_table_header(
@@ -1668,7 +1711,11 @@ where
         //
         // The spacers preserve the flex container's total content width so that
         // the scrollbar range stays correct.
+        //
+        // Right fixed columns (`scroll_end..total_cols`) render in their own
+        // region after the scrollable one, pinned to the right edge.
         let total_cols = self.col_groups.len();
+        let scroll_end = self.fixed_right_start();
         let (visible_col_range, left_spacer) =
             self.calculate_visible_leaf_col_range(left_columns_count);
 
@@ -1677,6 +1724,9 @@ where
         // Reset fixed head columns bounds, if no fixed columns are present
         if left_columns_count == 0 {
             self.fixed_head_cols_bounds = Bounds::default();
+        }
+        if scroll_end == total_cols {
+            self.fixed_right_head_cols_bounds = Bounds::default();
         }
 
         let mut header = self.delegate_mut().render_header(window, cx);
@@ -1820,9 +1870,9 @@ where
                                                 None
                                             }
                                         }))
-                                        .when(visible_col_range.end < total_cols, |r| {
+                                        .when(visible_col_range.end < scroll_end, |r| {
                                             let right_spacer: Pixels = self.col_groups
-                                                [visible_col_range.end..total_cols]
+                                                [visible_col_range.end..scroll_end]
                                                 .iter()
                                                 .map(|g| g.width)
                                                 .sum();
@@ -1833,7 +1883,9 @@ where
                                         // Group header rows have far fewer cells (one per group),
                                         // so the cost of rendering all of them is negligible.
                                         this.children(row_cells.iter().filter_map(|cell| {
-                                            if cell.start_leaf_col_ix >= left_columns_count {
+                                            if cell.start_leaf_col_ix >= left_columns_count
+                                                && cell.start_leaf_col_ix < scroll_end
+                                            {
                                                 if cell.is_leaf {
                                                     if let Some(ix) = cell.leaf_col_ix {
                                                         return Some(
@@ -1863,6 +1915,151 @@ where
                         }),
                     )),
             )
+            .when(scroll_end < total_cols, |this| {
+                let view = view.clone();
+                // Render right fixed columns
+                this.child(
+                    h_flex()
+                        .relative()
+                        .h_full()
+                        .flex_shrink_0()
+                        .bg(cx.theme().tokens.table_head)
+                        .child(
+                            v_flex()
+                                .flex_shrink_0()
+                                .children(layout.iter().map(|row_cells| {
+                                    h_flex()
+                                        .min_w_full()
+                                        .h(self.options.size.table_row_height())
+                                        .border_b_1()
+                                        .border_color(cx.theme().border)
+                                        .children(row_cells.iter().filter_map(|cell| {
+                                            if cell.start_leaf_col_ix < scroll_end {
+                                                return None;
+                                            }
+                                            if cell.is_leaf {
+                                                let ix = cell.leaf_col_ix?;
+                                                Some(
+                                                    self.render_th(ix, window, cx)
+                                                        .into_any_element(),
+                                                )
+                                            } else {
+                                                Some(
+                                                    self.delegate_mut()
+                                                        .render_group_th(
+                                                            &cell.label,
+                                                            cell.col_span,
+                                                            cell.width,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                        .into_any_element(),
+                                                )
+                                            }
+                                        }))
+                                })),
+                        )
+                        .child(
+                            // Fixed columns border
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .bottom_0()
+                                .w_0()
+                                .flex_shrink_0()
+                                .border_l_1()
+                                .border_color(cx.theme().border),
+                        )
+                        .on_prepaint(move |bounds, _, cx| {
+                            view.update(cx, |r, _| r.fixed_right_head_cols_bounds = bounds)
+                        }),
+                )
+            })
+    }
+
+    /// Render the right fixed cells of a row, `right_start..columns_count`.
+    fn render_fixed_right_cells(
+        &mut self,
+        row_ix: usize,
+        right_start: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let cols_count = self.col_groups.len();
+        h_flex()
+            .relative()
+            .h_full()
+            .flex_shrink_0()
+            .children(
+                (right_start..cols_count)
+                    .map(|col_ix| self.render_body_cell(row_ix, col_ix, window, cx))
+                    .collect::<Vec<_>>(),
+            )
+            .child(
+                // Fixed columns border
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .bottom_0()
+                    .w_0()
+                    .flex_shrink_0()
+                    .border_l_1()
+                    .border_color(cx.theme().border),
+            )
+    }
+
+    /// Render a body cell of a fixed column, with its selection overlays and
+    /// cell click handlers.
+    fn render_body_cell(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let is_cell_selected =
+            self.selected_cell == Some((row_ix, col_ix)) && self.selection_mode.is_cell();
+        let is_cell_right_clicked = self.right_clicked_cell == Some((row_ix, col_ix));
+
+        self.render_col_wrap(Some(row_ix), col_ix, window, cx)
+            .child(
+                self.render_cell(Some(row_ix), col_ix, window, cx)
+                    .id(format!("table-cell:{}:{}", row_ix, col_ix))
+                    .relative()
+                    .child(self.measure_render_td(row_ix, col_ix, window, cx))
+                    .when(is_cell_selected, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .bg(cx.theme().tokens.table_active)
+                                .border_1()
+                                .border_color(cx.theme().table_active_border),
+                        )
+                    })
+                    .when(is_cell_right_clicked && !is_cell_selected, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .border_1()
+                                .border_color(cx.theme().table_active_border.opacity(0.5)),
+                        )
+                    })
+                    .when(self.cell_selectable, |this| {
+                        this.on_click(cx.listener(move |table, e, window, cx| {
+                            table.on_cell_click(e, row_ix, col_ix, window, cx);
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |table, e, window, cx| {
+                                table.on_cell_right_click(e, row_ix, col_ix, window, cx);
+                            }),
+                        )
+                    }),
+            )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1882,6 +2079,7 @@ where
         let is_selected = self.selected_row == Some(row_ix);
         let view = cx.entity().clone();
         let row_height = self.options.size.table_row_height();
+        let right_start = self.fixed_right_start();
 
         if row_ix < rows_count {
             let is_last_row = row_ix + 1 == rows_count;
@@ -2120,6 +2318,10 @@ where
                         )
                         .child(self.delegate.render_last_empty_col(window, cx)),
                 )
+                .when(right_start < self.col_groups.len(), |this| {
+                    // Right fixed columns
+                    this.child(self.render_fixed_right_cells(row_ix, right_start, window, cx))
+                })
                 // Row selected style
                 // Note: Don't show row selection if a cell is selected
                 .when_some(self.selected_row, |this, _| {
@@ -2282,7 +2484,7 @@ where
         div()
             .absolute()
             .left(self.fixed_head_cols_bounds.size.width)
-            .right_0()
+            .right(self.fixed_right_head_cols_bounds.size.width)
             .bottom_0()
             .h(Scrollbar::width())
             .child(Scrollbar::horizontal(&self.horizontal_scroll_handle).viewport_from_layout())
@@ -2312,6 +2514,8 @@ where
             .iter()
             .filter(|col| self.col_fixed && col.column.fixed == Some(ColumnFixed::Left))
             .count();
+        // The scrollable columns are `left_columns_count..right_start`.
+        let right_start = self.fixed_right_start();
         let rows_count = self.delegate.rows_count(cx);
         let loading = self.delegate.loading(cx);
 
@@ -2391,6 +2595,7 @@ where
                                             table
                                                 .col_groups
                                                 .iter()
+                                                .take(right_start)
                                                 .skip(left_columns_count)
                                                 .map(|col| gpui::Size {
                                                     width: col.width,
@@ -2500,5 +2705,94 @@ where
                         ),
                 )
             })
+    }
+}
+
+/// The index of the first right fixed column of `cols_count` columns whose
+/// last `right_count` columns are fixed on the right.
+fn fixed_right_start(cols_count: usize, right_count: usize) -> usize {
+    cols_count.saturating_sub(right_count)
+}
+
+/// Compute the visible range of the scrollable columns in `cols`.
+///
+/// Returns `(visible_range, left_spacer_width)`, see
+/// `TableState::calculate_visible_leaf_col_range`.
+fn visible_leaf_col_range(
+    width: impl Fn(usize) -> Pixels,
+    cols: Range<usize>,
+    scroll_x: Pixels,
+    available_width: Pixels,
+) -> (Range<usize>, Pixels) {
+    // Walk left-to-right through the scrollable columns to find the first one
+    // whose right edge enters the viewport. The accumulated width of the
+    // skipped columns becomes the left spacer width.
+    let mut range_start = cols.start;
+    let mut left_spacer = px(0.);
+    let mut cumulative = px(0.);
+    for i in cols.clone() {
+        let right_edge = cumulative + width(i);
+        if right_edge > scroll_x {
+            range_start = i;
+            left_spacer = cumulative;
+            break;
+        }
+        cumulative = right_edge;
+    }
+
+    // Continue from `range_start` (skipping already-scanned columns) to
+    // find the last column still within the viewport. The 200 px overdraw
+    // buffer prevents a visible flash when the user scrolls quickly.
+    let right_bound = scroll_x + available_width + px(200.);
+    let mut range_end = cols.end;
+    let mut cumulative = left_spacer; // already summed widths before `range_start`
+    for i in range_start..cols.end {
+        cumulative += width(i);
+        if cumulative > right_bound {
+            range_end = (i + 1).min(cols.end);
+            break;
+        }
+    }
+
+    (range_start..range_end, left_spacer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fixed_right_start() {
+        assert_eq!(fixed_right_start(5, 0), 5);
+        assert_eq!(fixed_right_start(5, 2), 3);
+        assert_eq!(fixed_right_start(1, 3), 0);
+    }
+
+    #[test]
+    fn test_visible_leaf_col_range_excludes_fixed_columns() {
+        // 2 left fixed, 6 scrollable, 2 right fixed columns of 100px.
+        let width = |_| px(100.);
+
+        // Everything fits: all the scrollable columns, none of the fixed ones.
+        let (range, spacer) = visible_leaf_col_range(width, 2..8, px(0.), px(1000.));
+        assert_eq!(range, 2..8);
+        assert_eq!(spacer, px(0.));
+
+        // Scrolled by 250px: the 3rd scrollable column (ix 4) is the first
+        // visible one, and the overdraw ends before the right fixed columns.
+        let (range, spacer) = visible_leaf_col_range(width, 2..8, px(250.), px(100.));
+        assert_eq!(range, 4..8);
+        assert_eq!(spacer, px(200.));
+
+        // Narrow viewport: the range ends after the overdraw buffer.
+        let (range, _) = visible_leaf_col_range(width, 2..8, px(0.), px(50.));
+        assert_eq!(range, 2..5);
+    }
+
+    #[test]
+    fn test_visible_leaf_col_range_without_scrollable_columns() {
+        let (range, spacer) = visible_leaf_col_range(|_| px(100.), 3..3, px(0.), px(500.));
+        assert_eq!(range, 3..3);
+        assert_eq!(spacer, px(0.));
     }
 }

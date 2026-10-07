@@ -350,7 +350,11 @@ impl StockTableDelegate {
                 Column::new("day_10_ranking", "10d Ranking"),
                 Column::new("day_30_ranking", "30d Ranking"),
                 Column::new("day_120_ranking", "120d Ranking"),
-                Column::new("day_250_ranking", "250d Ranking"),
+                // Pinned to the right edge; the extra columns are inserted
+                // before it, see `StockTableDelegate::column_ix`.
+                Column::new("day_250_ranking", "250d Ranking")
+                    .width(110.)
+                    .fixed(ColumnFixed::Right),
             ],
             extra_columns_count: 0,
             loading: false,
@@ -360,6 +364,20 @@ impl StockTableDelegate {
             visible_cols: Range::default(),
             visible_rows: Range::default(),
             _load_task: Task::ready(()),
+        }
+    }
+
+    /// Map a table column index to `self.columns`, `None` for an extra
+    /// column. The extra columns sit before the last column, which is pinned
+    /// to the right.
+    fn column_ix(&self, col_ix: usize) -> Option<usize> {
+        let last = self.columns.len().saturating_sub(1);
+        if col_ix < last {
+            Some(col_ix)
+        } else if col_ix == last + self.extra_columns_count {
+            Some(last)
+        } else {
+            None
         }
     }
 
@@ -430,10 +448,10 @@ impl TableDelegate for StockTableDelegate {
     }
 
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        if let Some(col) = self.columns.get(col_ix) {
-            col.clone()
+        if let Some(ix) = self.column_ix(col_ix) {
+            self.columns[ix].clone()
         } else {
-            let n = col_ix - self.columns.len() + 1;
+            let n = col_ix + 2 - self.columns.len();
             Column::new(format!("extra_{n}"), format!("Column {n}"))
         }
     }
@@ -468,7 +486,11 @@ impl TableDelegate for StockTableDelegate {
                 },
                 ColumnGroup {
                     label: "Market Data".into(),
-                    span: self.columns_count(cx) - 25,
+                    span: self.columns_count(cx) - 26,
+                },
+                ColumnGroup {
+                    label: "Pinned".into(),
+                    span: 1,
                 },
             ],
         ])
@@ -548,7 +570,7 @@ impl TableDelegate for StockTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let stock = self.stocks.get(row_ix).unwrap();
-        let Some(col) = self.columns.get(col_ix) else {
+        let Some(col) = self.column_ix(col_ix).and_then(|ix| self.columns.get(ix)) else {
             return div().child("--").into_any_element();
         };
 
@@ -650,6 +672,9 @@ impl TableDelegate for StockTableDelegate {
         _: &mut Window,
         _: &mut Context<TableState<Self>>,
     ) {
+        let (Some(col_ix), Some(to_ix)) = (self.column_ix(col_ix), self.column_ix(to_ix)) else {
+            return;
+        };
         let col = self.columns.remove(col_ix);
         self.columns.insert(to_ix, col);
     }
@@ -661,7 +686,10 @@ impl TableDelegate for StockTableDelegate {
         _: &mut Window,
         _: &mut Context<TableState<Self>>,
     ) {
-        if let Some(col) = self.columns.get_mut(col_ix) {
+        if let Some(col) = self
+            .column_ix(col_ix)
+            .and_then(|ix| self.columns.get_mut(ix))
+        {
             match col.key.as_ref() {
                 "id" => self.stocks.sort_by(|a, b| match sort {
                     ColumnSort::Descending => b.id.cmp(&a.id),
@@ -745,7 +773,7 @@ impl TableDelegate for StockTableDelegate {
         let Some(stock) = self.stocks.get(row_ix) else {
             return String::new();
         };
-        let Some(col) = self.columns.get(col_ix) else {
+        let Some(col) = self.column_ix(col_ix).and_then(|ix| self.columns.get(ix)) else {
             return String::new();
         };
 
