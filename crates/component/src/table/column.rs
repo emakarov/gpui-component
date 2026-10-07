@@ -26,7 +26,8 @@ pub struct Column {
     pub paddings: Option<Edges<Pixels>>,
     /// The width of the column.
     pub width: Pixels,
-    /// Whether the column is fixed, the fixed column will pin at the left side when scrolling horizontally.
+    /// Whether the column is fixed, a fixed column stays pinned at the left or
+    /// right edge of the table when scrolling horizontally. See [`ColumnFixed`].
     pub fixed: Option<ColumnFixed>,
     /// Whether the column is resizable.
     pub resizable: bool,
@@ -165,6 +166,14 @@ impl Column {
         self
     }
 
+    /// Set whether the column is fixed on right side, default is false.
+    ///
+    /// See [`ColumnFixed::Right`].
+    pub fn fixed_right(mut self) -> Self {
+        self.fixed = Some(ColumnFixed::Right);
+        self
+    }
+
     /// Set whether the column is resizable, default is true.
     pub fn resizable(mut self, resizable: bool) -> Self {
         self.resizable = resizable;
@@ -227,9 +236,23 @@ impl Column {
 
 impl FluentBuilder for Column {}
 
+/// Where a fixed column is pinned.
+///
+/// Fixed columns are taken by position: the `Left` columns must be the first
+/// columns of the table and the `Right` columns its last columns. A column
+/// group header is placed in the region of its first column, so a group
+/// should not span two regions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnFixed {
+    /// Pinned to the left edge, before the scrollable columns.
     Left,
+    /// Pinned to the right edge of the table viewport, after the scrollable
+    /// columns. When all columns fit, the right columns still sit at the
+    /// right edge and the gap is left before them.
+    ///
+    /// A right column is resized from its left edge, and it can only be
+    /// moved among the other right columns.
+    Right,
 }
 
 /// Used to sort the column runtime info in Table internal.
