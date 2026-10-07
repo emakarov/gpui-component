@@ -199,6 +199,21 @@ impl Notification {
         self
     }
 
+    /// The notification's type, if one was set.
+    pub fn notification_type(&self) -> Option<NotificationType> {
+        self.type_
+    }
+
+    /// The notification's title, if one was set.
+    pub fn title_text(&self) -> Option<&SharedString> {
+        self.title.as_ref()
+    }
+
+    /// The notification's message, if one was set.
+    pub fn message_text(&self) -> Option<&SharedString> {
+        self.message.as_ref()
+    }
+
     /// Create an info notification with the given message.
     pub fn info(message: impl Into<SharedString>) -> Self {
         Self::new()
