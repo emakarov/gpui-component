@@ -1258,6 +1258,36 @@ where
             ColumnSort::Default => ColumnSort::Descending,
         };
 
+        self.apply_sort(col_ix, sort, window, cx);
+    }
+
+    /// Sort by the column at `col_ix`, as clicking its header until it shows
+    /// `sort` would. Does nothing when the table or the column is not sortable.
+    pub fn sort_column(
+        &mut self,
+        col_ix: usize,
+        sort: ColumnSort,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sortable || self.column_sort(col_ix).is_none() {
+            return;
+        }
+        self.apply_sort(col_ix, sort, window, cx);
+    }
+
+    /// The sort the column at `col_ix` shows, `None` when it is not sortable.
+    pub fn column_sort(&self, col_ix: usize) -> Option<ColumnSort> {
+        self.col_groups.get(col_ix).and_then(|g| g.column.sort)
+    }
+
+    fn apply_sort(
+        &mut self,
+        col_ix: usize,
+        sort: ColumnSort,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         for (ix, col_group) in self.col_groups.iter_mut().enumerate() {
             if ix == col_ix {
                 col_group.column.sort = Some(sort);
