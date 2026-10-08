@@ -218,6 +218,11 @@ pub struct TableState<D: TableDelegate> {
     fixed_right_head_cols_bounds: Bounds<Pixels>,
 
     col_groups: Vec<ColGroup>,
+    /// The column indices of the visible columns, in display order. A
+    /// display position indexes this.
+    visible_cols: Vec<usize>,
+    /// The display position of each column index, `None` when hidden.
+    col_positions: Vec<Option<usize>>,
     header_layout: Vec<Vec<HeaderCell>>,
 
     /// Whether the table can loop selection, default is true.
@@ -271,16 +276,20 @@ pub struct TableState<D: TableDelegate> {
     selection_mode: SelectionMode,
     right_clicked_row: Option<usize>,
     right_clicked_cell: Option<(usize, usize)>,
+    /// The column whose header cell has been right-clicked, taken by the
+    /// header context menu.
+    right_clicked_header: Option<usize>,
     selected_col: Option<usize>,
     selected_cell: Option<(usize, usize)>,
 
     /// The column index that is being resized.
     resizing_col: Option<usize>,
 
-    /// The insertion gap index (`0..=cols_count`) while dragging a column
-    /// header: the dragged column will be inserted between the columns
-    /// `gap - 1` and `gap` on drop.
-    col_drag_gap: Option<usize>,
+    /// The insertion gap while dragging a column header, as `(gap, to_ix)`:
+    /// `gap` is a display position (`0..=visible_cols_count`), the dragged
+    /// column shows between the visible columns `gap - 1` and `gap` on drop,
+    /// by moving it to the column index `to_ix`.
+    col_drag_gap: Option<(usize, usize)>,
 
     /// The visible range of the rows and columns.
     visible_range: TableVisibleRange,
@@ -300,6 +309,8 @@ where
             options: TableOptions::default(),
             delegate,
             col_groups: Vec::new(),
+            visible_cols: Vec::new(),
+            col_positions: Vec::new(),
             header_layout: Vec::new(),
             horizontal_scroll_handle: VirtualListScrollHandle::new(),
             vertical_scroll_handle: UniformListScrollHandle::new(),
@@ -307,6 +318,7 @@ where
             selected_row: None,
             right_clicked_row: None,
             right_clicked_cell: None,
+            right_clicked_header: None,
             selected_col: None,
             selected_cell: None,
             resizing_col: None,
@@ -439,66 +451,22 @@ where
 
     // Scroll to the column at the given index.
     pub fn scroll_to_col(&mut self, col_ix: usize, cx: &mut Context<Self>) {
-        // A right fixed column is always visible, nothing to scroll.
-        if col_ix >= self.fixed_right_start() {
+        // A hidden column has nowhere to scroll to, and a right fixed column
+        // is always visible.
+        let Some(pos) = self.col_position(col_ix) else {
+            cx.notify();
+            return;
+        };
+        if pos >= self.fixed_right_start() {
             cx.notify();
             return;
         }
 
-        let col_ix = col_ix.saturating_sub(self.fixed_left_cols_count());
+        let item_ix = pos.saturating_sub(self.fixed_left_cols_count());
 
-        // Resolve the offset here instead of deferring it to the virtual list.
-        //
-        // The header and the rows share `horizontal_scroll_handle`, but only
-        // the rows are a `VirtualList`, and a deferred `scroll_to_item` is
-        // applied during that list's prepaint — which runs *after* the header
-        // has already been rendered and prepainted with the old offset. The
-        // header would therefore stay one frame behind the rows.
-        match self.horizontal_offset_for_col(col_ix) {
-            Some(offset_x) => {
-                let mut offset = self.horizontal_scroll_handle.offset();
-                offset.x = offset_x;
-                self.horizontal_scroll_handle.set_offset(offset);
-            }
-            // Before the first layout the viewport size is unknown, let the
-            // virtual list resolve the offset once it has been laid out.
-            None => self
-                .horizontal_scroll_handle
-                .scroll_to_item(col_ix, ScrollStrategy::Top),
-        }
-
+        self.horizontal_scroll_handle
+            .scroll_to_item(item_ix, ScrollStrategy::Top);
         cx.notify();
-    }
-
-    /// The horizontal scroll offset that brings the scrollable (non-fixed)
-    /// column at `col_ix` fully into view.
-    ///
-    /// This mirrors the nearest-edge behavior of [`VirtualListScrollHandle::scroll_to_item`]
-    /// with [`ScrollStrategy::Top`]: an already visible column keeps the current
-    /// offset, otherwise the column is aligned to the edge it overflows. Both
-    /// of those move the offset towards a column that exists, so the result
-    /// never runs past the content and needs no extra clamping.
-    ///
-    /// Returns `None` when the viewport size is not known yet, or when `col_ix`
-    /// is out of range.
-    fn horizontal_offset_for_col(&self, col_ix: usize) -> Option<Pixels> {
-        let viewport_width = self.horizontal_scroll_handle.bounds().size.width;
-        if viewport_width <= px(0.) {
-            return None;
-        }
-
-        let cols = self.col_groups.get(self.fixed_left_cols_count()..)?;
-        let col_left: Pixels = cols.get(..col_ix)?.iter().map(|col| col.width).sum();
-        let col_right = col_left + cols.get(col_ix)?.width;
-        let offset_x = self.horizontal_scroll_handle.offset().x;
-
-        Some(if col_left + offset_x < px(0.) {
-            -col_left
-        } else if col_right + offset_x > viewport_width {
-            viewport_width - col_right
-        } else {
-            offset_x
-        })
     }
 
     /// Returns the current selection as one value.
@@ -515,6 +483,109 @@ where
         } else {
             TableSelection::None
         }
+    }
+
+
+    /// Returns whether the column at `col_ix` is visible, false for an
+    /// index out of range.
+    ///
+    /// See [`Column::hidden`](Column#structfield.hidden).
+    pub fn column_visible(&self, col_ix: usize) -> bool {
+        self.col_position(col_ix).is_some()
+    }
+
+    /// Returns the column indices of the visible columns, in display order.
+    pub fn visible_columns(&self) -> &[usize] {
+        &self.visible_cols
+    }
+
+    /// Show or hide the column at `col_ix`.
+    ///
+    /// A hidden column keeps its index, so the delegate keeps all of its
+    /// columns and none is renumbered. The delegate is told by
+    /// [`TableDelegate::column_visibility_changed`]; note that
+    /// [`TableState::refresh`] reads [`Column::hidden`](Column#structfield.hidden)
+    /// from the delegate again.
+    pub fn set_column_visible(&mut self, col_ix: usize, visible: bool, cx: &mut Context<Self>) {
+        let Some(col_group) = self.col_groups.get_mut(col_ix) else {
+            return;
+        };
+        if col_group.column.hidden != visible {
+            return;
+        }
+
+        col_group.column.hidden = !visible;
+        self.col_drag_gap = None;
+        self.update_header_layout(cx);
+        self.delegate.column_visibility_changed(col_ix, visible, cx);
+        cx.notify();
+    }
+
+    /// Move the column at `col_ix` so that it ends up at the index `to_ix`,
+    /// as dropping a dragged column header does, and returns whether it was
+    /// moved.
+    ///
+    /// A move is refused, and nothing changes, when an index is out of
+    /// range, when the column would leave its fixed region (see
+    /// [`ColumnFixed`]) or when [`TableDelegate::can_move_column`] refuses
+    /// it. Unlike a header drag, it does not check [`Self::col_movable`] or
+    /// [`Column::movable`](Column#structfield.movable), and it can move a
+    /// hidden column.
+    ///
+    /// An accepted move calls [`TableDelegate::move_column`], reorders the
+    /// table's columns and emits [`TableEvent::MoveColumn`].
+    pub fn move_column(
+        &mut self,
+        col_ix: usize,
+        to_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.can_move_column(col_ix, to_ix, cx) {
+            return false;
+        }
+
+        self.delegate.move_column(col_ix, to_ix, window, cx);
+        let col_group = self.col_groups.remove(col_ix);
+        self.col_groups.insert(to_ix, col_group);
+        self.update_header_layout(cx);
+
+        cx.emit(TableEvent::MoveColumn(col_ix, to_ix));
+        cx.notify();
+        true
+    }
+
+    /// Whether moving the column at `col_ix` to `to_ix` is a change that
+    /// keeps the fixed regions and that the delegate accepts.
+    fn can_move_column(&self, col_ix: usize, to_ix: usize, cx: &App) -> bool {
+        let len = self.col_groups.len();
+        if col_ix == to_ix || col_ix >= len || to_ix >= len {
+            return false;
+        }
+
+        let ranks = self.region_ranks();
+        move_keeps_regions(&ranks, col_ix, to_ix)
+            && self.delegate.can_move_column(col_ix, to_ix, cx)
+    }
+
+    /// The fixed region rank of every column, see [`region_rank`].
+    fn region_ranks(&self) -> Vec<u8> {
+        self.col_groups
+            .iter()
+            .map(|g| region_rank(g.column.fixed, self.col_fixed))
+            .collect()
+    }
+
+    /// The display position of the column at `col_ix`, `None` when it is
+    /// hidden or out of range.
+    fn col_position(&self, col_ix: usize) -> Option<usize> {
+        self.col_positions.get(col_ix).copied().flatten()
+    }
+
+    /// Whether the column at `col_ix` is shown in the right fixed region.
+    fn is_fixed_right(&self, col_ix: usize) -> bool {
+        self.col_position(col_ix)
+            .is_some_and(|pos| pos >= self.fixed_right_start())
     }
 
     /// Returns the selected row index.
@@ -740,7 +811,14 @@ where
         self.update_header_layout(cx);
     }
 
+    /// Recompute the visible columns, and the header layout from them.
     fn update_header_layout(&mut self, cx: &mut Context<Self>) {
+        self.visible_cols = visible_col_indices(self.col_groups.iter().map(|g| g.column.hidden));
+        self.col_positions = vec![None; self.col_groups.len()];
+        for (pos, &col_ix) in self.visible_cols.iter().enumerate() {
+            self.col_positions[col_ix] = Some(pos);
+        }
+
         let group_rows = self.delegate.group_headers(cx);
 
         let mut layout = match group_rows.as_ref() {
@@ -753,14 +831,20 @@ where
                 let mut cell_row = Vec::with_capacity(row.len());
                 let mut current_leaf_ix = 0;
                 for group in row {
+                    // A group spans column indices, it shows over the visible
+                    // ones only, and not at all when they are all hidden.
                     let mut width = px(0.);
-                    let start_leaf_col_ix = current_leaf_ix;
-                    for i in 0..group.span {
-                        if current_leaf_ix + i < self.col_groups.len() {
-                            width += self.col_groups[current_leaf_ix + i].width;
+                    let mut start_leaf_col_ix = None;
+                    for col_ix in current_leaf_ix..current_leaf_ix + group.span {
+                        if let Some(pos) = self.col_position(col_ix) {
+                            width += self.col_groups[col_ix].width;
+                            start_leaf_col_ix.get_or_insert(pos);
                         }
                     }
                     current_leaf_ix += group.span;
+                    let Some(start_leaf_col_ix) = start_leaf_col_ix else {
+                        continue;
+                    };
                     cell_row.push(HeaderCell {
                         label: group.label.clone(),
                         width,
@@ -774,15 +858,18 @@ where
             }
         }
 
-        let mut leaf_row = Vec::with_capacity(self.col_groups.len());
-        for (ix, group) in self.col_groups.iter().enumerate() {
+        // `leaf_col_ix` is the column index, `start_leaf_col_ix` the display
+        // position.
+        let mut leaf_row = Vec::with_capacity(self.visible_cols.len());
+        for (pos, &ix) in self.visible_cols.iter().enumerate() {
+            let group = &self.col_groups[ix];
             leaf_row.push(HeaderCell {
                 label: group.column.name.clone(),
                 width: group.width,
                 col_span: 1,
                 is_leaf: true,
                 leaf_col_ix: Some(ix),
-                start_leaf_col_ix: ix,
+                start_leaf_col_ix: pos,
             });
         }
         layout.push(leaf_row);
@@ -790,33 +877,52 @@ where
         self.header_layout = layout;
     }
 
+    /// The number of visible left fixed columns, which take the first
+    /// display positions.
     fn fixed_left_cols_count(&self) -> usize {
-        if !self.col_fixed {
-            return 0;
-        }
-
-        self.col_groups
-            .iter()
-            .filter(|col| col.column.fixed == Some(ColumnFixed::Left))
-            .count()
+        self.visible_fixed_cols_count(ColumnFixed::Left)
     }
 
     fn fixed_right_cols_count(&self) -> usize {
+        self.visible_fixed_cols_count(ColumnFixed::Right)
+    }
+
+    fn visible_fixed_cols_count(&self, fixed: ColumnFixed) -> usize {
         if !self.col_fixed {
             return 0;
         }
 
-        self.col_groups
+        self.visible_cols
             .iter()
-            .filter(|col| col.column.fixed == Some(ColumnFixed::Right))
+            .filter(|&&ix| self.col_groups[ix].column.fixed == Some(fixed))
             .count()
     }
 
-    /// The index of the first right fixed column, which is also the end of
-    /// the scrollable columns. Equals the columns count without right fixed
-    /// columns.
+    /// The display position of the first right fixed column, which is also
+    /// the end of the scrollable columns. Equals the visible columns count
+    /// without right fixed columns.
     fn fixed_right_start(&self) -> usize {
-        fixed_right_start(self.col_groups.len(), self.fixed_right_cols_count())
+        fixed_right_start(self.visible_cols.len(), self.fixed_right_cols_count())
+    }
+
+    /// The column index of the first visible column, 0 when none is.
+    fn first_visible_col(&self) -> usize {
+        self.visible_cols.first().copied().unwrap_or(0)
+    }
+
+    /// The column index of the last visible column, 0 when none is.
+    fn last_visible_col(&self) -> usize {
+        self.visible_cols.last().copied().unwrap_or(0)
+    }
+
+    /// The column index of the visible column before (or after, when
+    /// `forward`) the column at `col_ix`, see [`step_position`].
+    fn step_visible_col(&self, col_ix: usize, forward: bool) -> usize {
+        let Some(pos) = self.col_position(col_ix) else {
+            return self.first_visible_col();
+        };
+        let pos = step_position(pos, self.visible_cols.len(), forward, self.loop_selection);
+        self.visible_cols[pos]
     }
 
     fn page_item_count(&self) -> usize {
@@ -835,6 +941,7 @@ where
     ) {
         self.right_clicked_row = row_ix;
         self.right_clicked_cell = None;
+        self.right_clicked_header = None;
         cx.emit(TableEvent::RightClickedRow(row_ix));
     }
 
@@ -962,7 +1069,7 @@ where
                 self.set_selected_cell(new_row, col_ix, cx);
             } else {
                 // No cell selected, select first cell
-                self.set_selected_cell(0, 0, cx);
+                self.set_selected_cell(0, self.first_visible_col(), cx);
             }
             return;
         }
@@ -1007,7 +1114,7 @@ where
                 self.set_selected_cell(new_row, col_ix, cx);
             } else {
                 // No cell selected, select first cell
-                self.set_selected_cell(0, 0, cx);
+                self.set_selected_cell(0, self.first_visible_col(), cx);
             }
             return;
         }
@@ -1040,16 +1147,16 @@ where
         // Cell selection mode: move to first cell in current row
         if self.selection_mode.is_cell() {
             if let Some((row_ix, _)) = self.selected_cell {
-                self.set_selected_cell(row_ix, 0, cx);
+                self.set_selected_cell(row_ix, self.first_visible_col(), cx);
             } else {
                 // No cell selected, select first cell of first row
-                self.set_selected_cell(0, 0, cx);
+                self.set_selected_cell(0, self.first_visible_col(), cx);
             }
             return;
         }
 
         // Column selection mode
-        self.set_selected_col(0, cx);
+        self.set_selected_col(self.first_visible_col(), cx);
     }
 
     pub(super) fn action_select_last_column(
@@ -1058,21 +1165,21 @@ where
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let columns_count = self.delegate.columns_count(cx);
+        let last_col = self.last_visible_col();
 
         // Cell selection mode: move to last cell in current row
         if self.selection_mode.is_cell() {
             if let Some((row_ix, _)) = self.selected_cell {
-                self.set_selected_cell(row_ix, columns_count.saturating_sub(1), cx);
+                self.set_selected_cell(row_ix, last_col, cx);
             } else {
                 // No cell selected, select last cell of first row
-                self.set_selected_cell(0, columns_count.saturating_sub(1), cx);
+                self.set_selected_cell(0, last_col, cx);
             }
             return;
         }
 
         // Column selection mode
-        self.set_selected_col(columns_count.saturating_sub(1), cx);
+        self.set_selected_col(last_col, cx);
     }
 
     pub(super) fn action_select_page_up(
@@ -1090,7 +1197,7 @@ where
                 self.set_selected_cell(target, col_ix, cx);
             } else {
                 // No cell selected, select first cell
-                self.set_selected_cell(0, 0, cx);
+                self.set_selected_cell(0, self.first_visible_col(), cx);
             }
             return;
         }
@@ -1125,7 +1232,7 @@ where
                 self.set_selected_cell(target, col_ix, cx);
             } else {
                 // No cell selected, select first cell
-                self.set_selected_cell(0, 0, cx);
+                self.set_selected_cell(0, self.first_visible_col(), cx);
             }
             return;
         }
@@ -1146,35 +1253,20 @@ where
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let columns_count = self.delegate.columns_count(cx);
-
         // Cell selection mode: move left within the same row
         if self.selection_mode.is_cell() {
             if let Some((row_ix, col_ix)) = self.selected_cell {
-                let new_col = if col_ix > 0 {
-                    col_ix.saturating_sub(1)
-                } else if self.loop_selection {
-                    columns_count.saturating_sub(1)
-                } else {
-                    col_ix
-                };
+                let new_col = self.step_visible_col(col_ix, false);
                 self.set_selected_cell(row_ix, new_col, cx);
             } else {
                 // No cell selected, select first cell
-                self.set_selected_cell(0, 0, cx);
+                self.set_selected_cell(0, self.first_visible_col(), cx);
             }
             return;
         }
 
         // Column selection mode
-        let mut selected_col = self.selected_col.unwrap_or(0);
-        if selected_col > 0 {
-            selected_col = selected_col.saturating_sub(1);
-        } else {
-            if self.loop_selection {
-                selected_col = columns_count.saturating_sub(1);
-            }
-        }
+        let selected_col = self.step_visible_col(self.selected_col.unwrap_or(0), false);
         self.set_selected_col(selected_col, cx);
     }
 
@@ -1184,36 +1276,20 @@ where
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let columns_count = self.delegate.columns_count(cx);
-
         // Cell selection mode: move right within the same row
         if self.selection_mode.is_cell() {
             if let Some((row_ix, col_ix)) = self.selected_cell {
-                let new_col = if col_ix < columns_count.saturating_sub(1) {
-                    col_ix + 1
-                } else if self.loop_selection {
-                    0
-                } else {
-                    col_ix
-                };
+                let new_col = self.step_visible_col(col_ix, true);
                 self.set_selected_cell(row_ix, new_col, cx);
             } else {
                 // No cell selected, select first cell
-                self.set_selected_cell(0, 0, cx);
+                self.set_selected_cell(0, self.first_visible_col(), cx);
             }
             return;
         }
 
         // Column selection mode
-        let mut selected_col = self.selected_col.unwrap_or(0);
-        if selected_col < columns_count.saturating_sub(1) {
-            selected_col += 1;
-        } else {
-            if self.loop_selection {
-                selected_col = 0;
-            }
-        }
-
+        let selected_col = self.step_visible_col(self.selected_col.unwrap_or(0), true);
         self.set_selected_col(selected_col, cx);
     }
 
@@ -1330,32 +1406,16 @@ where
         cx.notify();
     }
 
-    fn move_column(
-        &mut self,
-        col_ix: usize,
-        to_ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if col_ix == to_ix {
-            return;
-        }
-
-        self.delegate.move_column(col_ix, to_ix, window, cx);
-        let col_group = self.col_groups.remove(col_ix);
-        self.col_groups.insert(to_ix, col_group);
-
-        cx.emit(TableEvent::MoveColumn(col_ix, to_ix));
-        cx.notify();
-    }
-
     /// Resolve the insertion gap for a column-header drag at the window
-    /// coordinate `x`, or `None` when dropping there would not move the
-    /// dragged column at `drag_col_ix`.
-    fn drag_gap_at(&self, x: Pixels, drag_col_ix: usize) -> Option<usize> {
+    /// coordinate `x`, as `(gap, to_ix)` (see `col_drag_gap`), or `None` when
+    /// dropping there would not move the dragged column at `drag_col_ix`, or
+    /// the move is refused (see [`Self::can_move_column`]).
+    fn drag_gap_at(&self, x: Pixels, drag_col_ix: usize, cx: &App) -> Option<(usize, usize)> {
+        let drag_pos = self.col_position(drag_col_ix)?;
         let fixed_count = self.fixed_left_cols_count();
         let right_start = self.fixed_right_start();
-        let has_right = right_start < self.col_groups.len();
+        let cols_count = self.visible_cols.len();
+        let has_right = right_start < cols_count;
 
         // A column can only be reordered within its own region: rendering
         // pins the first `fixed_count` columns, so a cross-region move would
@@ -1370,37 +1430,46 @@ where
         // Columns scrolled beneath the fixed region keep stale bounds, so
         // resolve `x` against the fixed columns alone when it falls in that
         // region, and against the visible scrollable columns otherwise.
+        let in_left = fixed_count > 0 && x < self.fixed_head_cols_bounds.right();
         let in_right = has_right && x >= self.fixed_right_head_cols_bounds.left();
-        let candidates = if pointer_in_fixed {
+        let candidates = if in_left {
             0..fixed_count
         } else if in_right {
-            right_start..self.col_groups.len()
+            right_start..cols_count
         } else {
             self.calculate_visible_leaf_col_range(fixed_count).0
         };
 
-        // Right fixed columns are taken by position, so they only move
-        // among themselves.
-        if has_right && (drag_col_ix >= right_start) != in_right {
+        // Fixed columns are taken by position, so left and right fixed
+        // columns only move among themselves, and no other column moves
+        // among them.
+        if (drag_pos < fixed_count) != in_left {
+            return None;
+        }
+        if has_right && (drag_pos >= right_start) != in_right {
             return None;
         }
 
         // The gap sits after the last candidate column whose center is left of `x`.
         let mut gap = candidates.start;
-        for ix in candidates {
-            if x < self.col_groups[ix].bounds.center().x {
+        for pos in candidates {
+            if x < self.col_groups[self.visible_cols[pos]].bounds.center().x {
                 break;
             }
-            gap = ix + 1;
+            gap = pos + 1;
         }
 
         // No gap if dropping there would put the dragged column back to
         // where it already is.
-        if gap == drag_col_ix || gap == drag_col_ix + 1 {
-            None
-        } else {
-            Some(gap)
+        if gap == drag_pos || gap == drag_pos + 1 {
+            return None;
         }
+
+        let to_ix = gap_move_index(&self.visible_cols, &self.region_ranks(), drag_col_ix, gap)?;
+        if !self.delegate.can_move_column(drag_col_ix, to_ix, cx) {
+            return None;
+        }
+        Some((gap, to_ix))
     }
 
     /// Dispatch delegate's `load_more` method when the visible range is near the end.
@@ -1558,7 +1627,7 @@ where
         let group_id = SharedString::from(format!("resizable-handle:{}", ix));
         // A right fixed column grows to the left, so its handle sits on its
         // left edge, laid over the cell (see `render_th`).
-        let on_left_edge = ix >= self.fixed_right_start();
+        let on_left_edge = self.is_fixed_right(ix);
 
         self.resize_handle_band(ix, ("resizable-handle", ix).into(), cx)
             .group(group_id.clone())
@@ -1634,7 +1703,7 @@ where
                                 .expect("BUG: invalid col index")
                                 .clone();
 
-                            if ix >= view.fixed_right_start() {
+                            if view.is_fixed_right(ix) {
                                 // The right edge of a right fixed column
                                 // stays put while it resizes, so measure
                                 // from it; the region does not scroll.
@@ -1765,7 +1834,10 @@ where
         let movable = self.col_movable && col_group.column.movable;
         let paddings = col_group.column.paddings;
         let name = col_group.column.name.clone();
-        let is_fixed_right = col_ix >= self.fixed_right_start();
+        let is_fixed_right = self.is_fixed_right(col_ix);
+        let pos = self
+            .col_position(col_ix)
+            .expect("BUG: render a hidden column");
 
         h_flex()
             .h_full()
@@ -1789,6 +1861,16 @@ where
                         // regardless of `unsorted_icon`'s setting.
                         this.perform_sort(col_ix, window, cx);
                     }))
+                    // For `TableDelegate::header_context_menu`.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            this.right_clicked_header = Some(col_ix);
+                            this.right_clicked_row = None;
+                            this.right_clicked_cell = None;
+                            cx.notify();
+                        }),
+                    )
                     .child(
                         h_flex()
                             .size_full()
@@ -1828,13 +1910,13 @@ where
                         // column, or on the right edge of the last column for the
                         // trailing gap. Use an absolutely positioned overlay instead
                         // of a border, to avoid shifting the cell content.
-                        let last_gap = col_ix + 1 == self.col_groups.len();
+                        let last_gap = pos + 1 == self.visible_cols.len();
                         match self.col_drag_gap {
-                            Some(gap)
+                            Some((gap, _))
                                 if cx.has_active_drag()
-                                    && (gap == col_ix || (last_gap && gap == col_ix + 1)) =>
+                                    && (gap == pos || (last_gap && gap == pos + 1)) =>
                             {
-                                let right_side = gap == col_ix + 1;
+                                let right_side = gap == pos + 1;
                                 this.relative().child(
                                     div()
                                         .absolute()
@@ -1882,7 +1964,7 @@ where
         }
 
         let fixed_width = self.fixed_head_cols_bounds.size.width
-            + if scroll_end < self.col_groups.len() {
+            + if scroll_end < self.visible_cols.len() {
                 self.fixed_right_head_cols_bounds.size.width
             } else {
                 px(0.)
@@ -1893,7 +1975,7 @@ where
         let scroll_x = (-self.horizontal_scroll_handle.offset().x).max(px(0.));
 
         visible_leaf_col_range(
-            |ix| self.col_groups[ix].width,
+            |pos| self.col_groups[self.visible_cols[pos]].width,
             left_columns_count..scroll_end,
             scroll_x,
             available_width,
@@ -1925,7 +2007,9 @@ where
         //
         // Right fixed columns (`scroll_end..total_cols`) render in their own
         // region after the scrollable one, pinned to the right edge.
-        let total_cols = self.col_groups.len();
+        //
+        // These ranges are display positions, hidden columns have none.
+        let total_cols = self.visible_cols.len();
         let scroll_end = self.fixed_right_start();
         let (visible_col_range, left_spacer) =
             self.calculate_visible_leaf_col_range(left_columns_count);
@@ -1957,7 +2041,7 @@ where
 
                 let gap =
                     if drag_entity_id == cx.entity_id() && e.bounds.contains(&e.event.position) {
-                        table.drag_gap_at(e.event.position.x, drag_col_ix)
+                        table.drag_gap_at(e.event.position.x, drag_col_ix, cx)
                     } else {
                         None
                     };
@@ -1973,10 +2057,9 @@ where
                 }
 
                 // Insert the dragged column into the indicated gap.
-                let Some(gap) = table.col_drag_gap.take() else {
+                let Some((_, to_ix)) = table.col_drag_gap.take() else {
                     return;
                 };
-                let to_ix = if drag.col_ix < gap { gap - 1 } else { gap };
                 table.move_column(drag.col_ix, to_ix, window, cx);
             }))
             .when(self.cell_selectable && self.row_header, |this| {
@@ -2070,7 +2153,9 @@ where
                                         .children(row_cells.iter().filter_map(|cell| {
                                             if cell.is_leaf {
                                                 let ix = cell.leaf_col_ix?;
-                                                if !visible_col_range.contains(&ix) {
+                                                if !visible_col_range
+                                                    .contains(&cell.start_leaf_col_ix)
+                                                {
                                                     return None;
                                                 }
                                                 Some(
@@ -2082,10 +2167,10 @@ where
                                             }
                                         }))
                                         .when(visible_col_range.end < scroll_end, |r| {
-                                            let right_spacer: Pixels = self.col_groups
+                                            let right_spacer: Pixels = self.visible_cols
                                                 [visible_col_range.end..scroll_end]
                                                 .iter()
-                                                .map(|g| g.width)
+                                                .map(|&ix| self.col_groups[ix].width)
                                                 .sum();
                                             r.child(div().w(right_spacer).h_full().flex_shrink_0())
                                         })
@@ -2189,7 +2274,8 @@ where
             })
     }
 
-    /// Render the right fixed cells of a row, `right_start..columns_count`.
+    /// Render the right fixed cells of a row, the display positions
+    /// `right_start..`.
     fn render_fixed_right_cells(
         &mut self,
         row_ix: usize,
@@ -2197,13 +2283,13 @@ where
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let cols_count = self.col_groups.len();
+        let cols = self.visible_cols[right_start..].to_vec();
         h_flex()
             .relative()
             .h_full()
             .flex_shrink_0()
             .children(
-                (right_start..cols_count)
+                cols.into_iter()
                     .map(|col_ix| self.render_body_cell(row_ix, col_ix, window, cx))
                     .collect::<Vec<_>>(),
             )
@@ -2280,7 +2366,6 @@ where
         rows_count: usize,
         left_columns_count: usize,
         col_sizes: Rc<Vec<gpui::Size<Pixels>>>,
-        columns_count: usize,
         is_filled: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2330,7 +2415,8 @@ where
                             .children({
                                 let mut items = Vec::with_capacity(left_columns_count);
 
-                                (0..left_columns_count).for_each(|col_ix| {
+                                (0..left_columns_count).for_each(|pos| {
+                                    let col_ix = self.visible_cols[pos];
                                     let is_cell_selected =
                                         self.selected_cell() == Some((row_ix, col_ix));
                                     let is_cell_right_clicked =
@@ -2434,8 +2520,9 @@ where
                                             visible_range.end - visible_range.start,
                                         );
 
-                                        visible_range.for_each(|col_ix| {
-                                            let col_ix = col_ix + left_columns_count;
+                                        visible_range.for_each(|item_ix| {
+                                            let col_ix =
+                                                table.visible_cols[item_ix + left_columns_count];
                                             let is_cell_selected =
                                                 table.selected_cell() == Some((row_ix, col_ix));
                                             let is_cell_right_clicked =
@@ -2519,7 +2606,7 @@ where
                         )
                         .child(self.delegate.render_last_empty_col(window, cx)),
                 )
-                .when(right_start < self.col_groups.len(), |this| {
+                .when(right_start < self.visible_cols.len(), |this| {
                     // Right fixed columns
                     this.child(self.render_fixed_right_cells(row_ix, right_start, window, cx))
                 })
@@ -2557,10 +2644,9 @@ where
                 .into_any_element()
         } else {
             let cols_width: Pixels = self
-                .col_groups
+                .visible_cols
                 .iter()
-                .take(columns_count)
-                .map(|col_group| col_group.width)
+                .map(|&col_ix| self.col_groups[col_ix].width)
                 .sum();
 
             // Render fake rows to fill the rest table space
@@ -2703,13 +2789,9 @@ where
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.measure(window, cx);
 
-        let columns_count = self.delegate.columns_count(cx);
-        let left_columns_count = self
-            .col_groups
-            .iter()
-            .filter(|col| self.col_fixed && col.column.fixed == Some(ColumnFixed::Left))
-            .count();
-        // The scrollable columns are `left_columns_count..right_start`.
+        let left_columns_count = self.fixed_left_cols_count();
+        // The scrollable columns are the display positions
+        // `left_columns_count..right_start`.
         let right_start = self.fixed_right_start();
         let rows_count = self.delegate.rows_count(cx);
         let loading = self.delegate.loading(cx);
@@ -2763,7 +2845,17 @@ where
             .context_menu({
                 let view = cx.entity().clone();
                 move |this, window: &mut Window, cx: &mut Context<PopupMenu>| {
-                    if let Some(row_ix) = view.read(cx).right_clicked_row {
+                    // A right-clicked header cell takes its menu from
+                    // `header_context_menu`, once.
+                    let header_col_ix =
+                        view.update(cx, |table, _| table.right_clicked_header.take());
+                    if let Some(col_ix) = header_col_ix {
+                        view.update(cx, |table, cx| {
+                            table
+                                .delegate_mut()
+                                .header_context_menu(col_ix, this, window, cx)
+                        })
+                    } else if let Some(row_ix) = view.read(cx).right_clicked_row {
                         view.update(cx, |menu, cx| {
                             menu.delegate_mut().context_menu(row_ix, this, window, cx)
                         })
@@ -2787,13 +2879,10 @@ where
                                         // `col.bounds.size.width`, which is only set after
                                         // prepaint and is therefore zero on the first frame.
                                         let col_sizes: Rc<Vec<gpui::Size<Pixels>>> = Rc::new(
-                                            table
-                                                .col_groups
+                                            table.visible_cols[left_columns_count..right_start]
                                                 .iter()
-                                                .take(right_start)
-                                                .skip(left_columns_count)
-                                                .map(|col| gpui::Size {
-                                                    width: col.width,
+                                                .map(|&ix| gpui::Size {
+                                                    width: table.col_groups[ix].width,
                                                     height: px(0.),
                                                 })
                                                 .collect(),
@@ -2834,7 +2923,6 @@ where
                                                 rows_count,
                                                 left_columns_count,
                                                 col_sizes.clone(),
-                                                columns_count,
                                                 is_filled,
                                                 window,
                                                 cx,
@@ -2907,6 +2995,77 @@ where
 /// last `right_count` columns are fixed on the right.
 fn fixed_right_start(cols_count: usize, right_count: usize) -> usize {
     cols_count.saturating_sub(right_count)
+}
+
+/// The column indices of the columns that are not hidden, in order.
+fn visible_col_indices(hidden: impl Iterator<Item = bool>) -> Vec<usize> {
+    hidden
+        .enumerate()
+        .filter_map(|(ix, hidden)| (!hidden).then_some(ix))
+        .collect()
+}
+
+/// The display position after (or before, when not `forward`) `pos` among
+/// `count` positions, wrapping around when `wrap`, else staying at the end.
+fn step_position(pos: usize, count: usize, forward: bool, wrap: bool) -> usize {
+    let last = count.saturating_sub(1);
+    match (forward, pos) {
+        (true, pos) if pos < last => pos + 1,
+        (true, _) if wrap => 0,
+        (false, pos) if pos > 0 => pos - 1,
+        (false, _) if wrap => last,
+        (_, pos) => pos,
+    }
+}
+
+/// The order of a column's fixed region: left fixed columns come first,
+/// then the scrollable ones, then the right fixed ones. Without `col_fixed`
+/// every column is scrollable.
+fn region_rank(fixed: Option<ColumnFixed>, col_fixed: bool) -> u8 {
+    match fixed {
+        _ if !col_fixed => 1,
+        Some(ColumnFixed::Left) => 0,
+        None => 1,
+        Some(ColumnFixed::Right) => 2,
+    }
+}
+
+/// Whether moving the column `from` to the index `to` keeps it inside its
+/// fixed region, given the [`region_rank`] of every column: its new
+/// neighbours must not rank after it on its left, nor before it on its right.
+fn move_keeps_regions(ranks: &[u8], from: usize, to: usize) -> bool {
+    let rank = ranks[from];
+    // The ranks once `from` is removed, where `to` is the insertion index.
+    let rest = |ix: usize| ranks[if ix < from { ix } else { ix + 1 }];
+    let prev_ok = to == 0 || rest(to - 1) <= rank;
+    let next_ok = to + 1 >= ranks.len() || rank <= rest(to);
+    prev_ok && next_ok
+}
+
+/// The column index to move the column `from` to, so that it shows in the
+/// display gap `gap` (between the visible columns `gap - 1` and `gap`), or
+/// `None` when no such index keeps the fixed regions, see
+/// [`move_keeps_regions`].
+///
+/// With hidden columns around the gap, several indices show the same way;
+/// the first one that keeps the regions is taken.
+fn gap_move_index(visible: &[usize], ranks: &[u8], from: usize, gap: usize) -> Option<usize> {
+    if ranks.len() < 2 || gap > visible.len() {
+        return None;
+    }
+
+    // Insertion indices count the columns once `from` is removed.
+    let removed = |ix: usize| if ix > from { ix - 1 } else { ix };
+    let start = match gap {
+        0 => 0,
+        gap => removed(visible[gap - 1]) + 1,
+    };
+    let end = match visible.get(gap) {
+        Some(&ix) => removed(ix),
+        None => ranks.len() - 1,
+    };
+
+    (start..=end).find(|&to| to != from && move_keeps_regions(ranks, from, to))
 }
 
 /// Compute the visible range of the scrollable columns in `cols`.
@@ -2982,6 +3141,125 @@ mod tests {
         // Narrow viewport: the range ends after the overdraw buffer.
         let (range, _) = visible_leaf_col_range(width, 2..8, px(0.), px(50.));
         assert_eq!(range, 2..5);
+    }
+
+    #[test]
+    fn test_visible_col_indices() {
+        let hidden = [false, true, false, false, true];
+        assert_eq!(visible_col_indices(hidden.into_iter()), vec![0, 2, 3]);
+        assert_eq!(
+            visible_col_indices([true, true].into_iter()),
+            Vec::<usize>::new()
+        );
+        assert_eq!(visible_col_indices(std::iter::empty()), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_step_position() {
+        assert_eq!(step_position(1, 3, true, false), 2);
+        assert_eq!(step_position(2, 3, true, false), 2);
+        assert_eq!(step_position(2, 3, true, true), 0);
+        assert_eq!(step_position(1, 3, false, false), 0);
+        assert_eq!(step_position(0, 3, false, false), 0);
+        assert_eq!(step_position(0, 3, false, true), 2);
+        assert_eq!(step_position(0, 0, true, true), 0);
+        assert_eq!(step_position(0, 0, false, true), 0);
+    }
+
+    #[test]
+    fn test_region_rank() {
+        assert_eq!(region_rank(Some(ColumnFixed::Left), true), 0);
+        assert_eq!(region_rank(None, true), 1);
+        assert_eq!(region_rank(Some(ColumnFixed::Right), true), 2);
+        assert_eq!(region_rank(Some(ColumnFixed::Left), false), 1);
+        assert_eq!(region_rank(Some(ColumnFixed::Right), false), 1);
+    }
+
+    #[test]
+    fn test_move_keeps_regions() {
+        // L L S S S R
+        let ranks = [0, 0, 1, 1, 1, 2];
+
+        // Within each region, up to the region borders.
+        assert!(move_keeps_regions(&ranks, 0, 1));
+        assert!(move_keeps_regions(&ranks, 2, 4));
+        assert!(move_keeps_regions(&ranks, 4, 2));
+
+        // A scrollable column may not go into the left or right region.
+        assert!(!move_keeps_regions(&ranks, 3, 0));
+        assert!(!move_keeps_regions(&ranks, 3, 1));
+        assert!(!move_keeps_regions(&ranks, 2, 5));
+
+        // A left column may not leave the left region, a right one the right.
+        assert!(!move_keeps_regions(&ranks, 1, 2));
+        assert!(!move_keeps_regions(&ranks, 0, 4));
+        assert!(!move_keeps_regions(&ranks, 5, 4));
+
+        // Without fixed columns everything goes.
+        let ranks = [1, 1, 1];
+        assert!(move_keeps_regions(&ranks, 0, 2));
+        assert!(move_keeps_regions(&ranks, 2, 0));
+    }
+
+    #[test]
+    fn test_gap_move_index_matches_plain_reorder() {
+        // No hidden columns, no fixed regions: the classic
+        // `if from < gap { gap - 1 } else { gap }`.
+        let visible = [0, 1, 2, 3, 4];
+        let ranks = [1; 5];
+        for from in 0..5 {
+            for gap in 0..=5 {
+                if gap == from || gap == from + 1 {
+                    continue;
+                }
+                let expected = if from < gap { gap - 1 } else { gap };
+                assert_eq!(
+                    gap_move_index(&visible, &ranks, from, gap),
+                    Some(expected),
+                    "from {from} gap {gap}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_gap_move_index_with_hidden_columns() {
+        // Columns 0..6, 1 and 4 hidden, so the display is [0, 2, 3, 5].
+        let visible = [0, 2, 3, 5];
+        let ranks = [1; 6];
+
+        // Column 5 to the first gap: before column 0.
+        assert_eq!(gap_move_index(&visible, &ranks, 5, 0), Some(0));
+        // Column 0 between 3 and 5: right after column 3.
+        assert_eq!(gap_move_index(&visible, &ranks, 0, 3), Some(3));
+        // Column 0 to the end: after column 5.
+        assert_eq!(gap_move_index(&visible, &ranks, 0, 4), Some(5));
+        // Column 5 between 0 and 2: right after column 0.
+        assert_eq!(gap_move_index(&visible, &ranks, 5, 1), Some(1));
+    }
+
+    #[test]
+    fn test_gap_move_index_keeps_fixed_regions() {
+        // L L S S R, all visible.
+        let visible = [0, 1, 2, 3, 4];
+        let ranks = [0, 0, 1, 1, 2];
+
+        // A scrollable column dropped inside the left region is refused; at
+        // the left region's end it lands first among the scrollable ones.
+        assert_eq!(gap_move_index(&visible, &ranks, 3, 0), None);
+        assert_eq!(gap_move_index(&visible, &ranks, 3, 1), None);
+        assert_eq!(gap_move_index(&visible, &ranks, 3, 2), Some(2));
+        // Into the right region is refused, as is a right column out of it.
+        assert_eq!(gap_move_index(&visible, &ranks, 2, 5), None);
+        assert_eq!(gap_move_index(&visible, &ranks, 4, 2), None);
+        // A left column stays among the left ones.
+        assert_eq!(gap_move_index(&visible, &ranks, 0, 2), Some(1));
+        assert_eq!(gap_move_index(&visible, &ranks, 0, 3), None);
+
+        // The left column 1 is hidden: a scrollable column dropped right
+        // after the visible left column lands after the hidden one too.
+        let visible = [0, 2, 3, 4];
+        assert_eq!(gap_move_index(&visible, &ranks, 3, 1), Some(2));
     }
 
     #[test]

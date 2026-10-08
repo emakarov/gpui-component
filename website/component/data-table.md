@@ -219,6 +219,14 @@ impl TableDelegate for MyTableDelegate {
             .separator()
             .menu("Duplicate", Box::new(DuplicateRowAction(row_ix)))
     }
+
+    // Context menu for right-click on a header cell, none by default
+    fn header_context_menu(&mut self, col_ix: usize, menu: PopupMenu, _: &mut Window, cx: &mut Context<TableState<Self>>) -> PopupMenu {
+        let table = cx.entity().downgrade();
+        menu.item(PopupMenuItem::new("Hide Column").on_click(move |_, _, cx| {
+            _ = table.update(cx, |table, cx| table.set_column_visible(col_ix, false, cx));
+        }))
+    }
 }
 ```
 
@@ -393,6 +401,38 @@ cx.subscribe_in(&state, window, |view, table, event, _, cx| {
     }
 }).detach();
 ```
+
+A table addresses every column by its index, so a delegate whose columns can move must reorder its own columns in `move_column`, which is called for every accepted move before the table reorders its columns and emits `TableEvent::MoveColumn`. `can_move_column` can refuse a move; a refused move changes nothing. A column never leaves its fixed region (left, scrollable or right).
+
+```rust
+impl TableDelegate for MyTableDelegate {
+    fn can_move_column(&self, col_ix: usize, to_ix: usize, _: &App) -> bool {
+        // e.g. keep the first column first
+        col_ix != 0 && to_ix != 0
+    }
+
+    fn move_column(&mut self, col_ix: usize, to_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) {
+        let col = self.columns.remove(col_ix);
+        self.columns.insert(to_ix, col);
+    }
+}
+
+// Move without a drag, it returns whether the column moved.
+state.update(cx, |state, cx| state.move_column(3, 1, window, cx));
+```
+
+### Column Visibility
+
+A hidden column keeps its index and stays in the delegate, it is only left out of the table:
+
+```rust
+Column::new("notes", "Notes").hidden(true);
+
+state.update(cx, |state, cx| state.set_column_visible(col_ix, true, cx));
+let visible = state.read(cx).column_visible(col_ix);
+```
+
+`TableState::refresh` reads `Column::hidden` from the delegate again, so implement `TableDelegate::column_visibility_changed` to keep it.
 
 ### Infinite Loading / Pagination
 
@@ -683,6 +723,10 @@ impl TableDelegate for MyTableDelegate {
 - `clear_selection(cx)` - Clear all selections
 - `scroll_to_row(row_ix, cx)` - Scroll to specific row
 - `scroll_to_col(col_ix, cx)` - Scroll to specific column
+- `set_column_visible(col_ix, visible, cx)` - Show or hide a column
+- `column_visible(col_ix)` - Whether a column is visible
+- `visible_columns()` - The visible column indices, in display order
+- `move_column(col_ix, to_ix, window, cx)` - Move a column, returns whether it moved
 
 #### Column
 
@@ -696,6 +740,7 @@ impl TableDelegate for MyTableDelegate {
 - `fixed(ColumnFixed)` - Pin column to left
 - `resizable(bool)` - Enable/disable column resizing
 - `movable(bool)` - Enable/disable column moving
+- `hidden(bool)` - Hide the column
 - `selectable(bool)` - Enable/disable column/cell selection
 - `paddings(edges)` - Set custom padding
 - `min_width(pixels)` - Set minimum width
