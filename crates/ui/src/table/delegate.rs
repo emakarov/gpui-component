@@ -125,6 +125,21 @@ pub trait TableDelegate: Sized + 'static {
         menu
     }
 
+    /// Render the context menu for the header cell of the column at `col_ix`,
+    /// shown when the header cell is right-clicked.
+    ///
+    /// The default returns `menu` unchanged, and an empty menu is not shown,
+    /// so a header has no context menu unless this is implemented.
+    fn header_context_menu(
+        &mut self,
+        col_ix: usize,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        menu
+    }
+
     /// Render cell at the given row and column.
     fn render_td(
         &mut self,
@@ -134,14 +149,61 @@ pub trait TableDelegate: Sized + 'static {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement;
 
+    /// Return false to refuse moving the column at `col_ix` to the index
+    /// `to_ix`, default is true.
+    ///
+    /// It is asked while a column header is dragged, to show no drop
+    /// indicator for a refused move, and again before every move, including
+    /// [`TableState::move_column`], so it must be cheap. A refused move
+    /// changes nothing: neither the table nor [`TableDelegate::move_column`]
+    /// is touched and no [`TableEvent::MoveColumn`] is emitted.
+    ///
+    /// The table already refuses a move that would take a column out of its
+    /// fixed region, see [`ColumnFixed`].
+    ///
+    /// [`TableEvent::MoveColumn`]: crate::table::TableEvent::MoveColumn
+    /// [`ColumnFixed`]: crate::table::ColumnFixed
+    fn can_move_column(&self, col_ix: usize, to_ix: usize, cx: &App) -> bool {
+        true
+    }
+
     /// Move the column at the given `col_ix` so that it ends up at the index `to_ix`.
     ///
     /// e.g.: `let col = self.columns.remove(col_ix); self.columns.insert(to_ix, col);`
+    ///
+    /// This is called for an accepted move only (see
+    /// [`TableDelegate::can_move_column`]), right before the table reorders
+    /// its own columns the same way, and before
+    /// [`TableEvent::MoveColumn`](crate::table::TableEvent::MoveColumn)`(col_ix, to_ix)`
+    /// is emitted.
+    ///
+    /// A delegate whose table can move columns must implement it: the table
+    /// addresses every column by its index, so after a move
+    /// [`TableDelegate::column`], [`TableDelegate::render_th`],
+    /// [`TableDelegate::render_td`] and the other per-column methods must
+    /// answer for the new order, and so must [`TableDelegate::column`] when
+    /// [`TableState::refresh`] reads the columns again. Indices of hidden
+    /// columns count too, the indices are always the delegate's own.
     fn move_column(
         &mut self,
         col_ix: usize,
         to_ix: usize,
         window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+    }
+
+    /// Called after [`TableState::set_column_visible`] has shown or hidden
+    /// the column at `col_ix`.
+    ///
+    /// [`TableState::refresh`] reads the columns again, so a delegate that
+    /// wants the visibility to survive it returns the same
+    /// [`Column::hidden`](Column#structfield.hidden) from
+    /// [`TableDelegate::column`], e.g. by storing it here.
+    fn column_visibility_changed(
+        &mut self,
+        col_ix: usize,
+        visible: bool,
         cx: &mut Context<TableState<Self>>,
     ) {
     }

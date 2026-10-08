@@ -33,6 +33,13 @@ pub struct Column {
     pub resizable: bool,
     /// Whether the column is movable.
     pub movable: bool,
+    /// Whether the column is hidden.
+    ///
+    /// A hidden column keeps its index: the delegate still owns it and the
+    /// other columns are not renumbered, it is only left out of the header,
+    /// the rows, the fixed regions, scrolling and resizing. See
+    /// [`TableState::set_column_visible`](crate::table::TableState::set_column_visible).
+    pub hidden: bool,
     /// Whether the column is selectable.
     ///
     /// When `true`:
@@ -77,6 +84,7 @@ impl Default for Column {
             fixed: None,
             resizable: true,
             movable: true,
+            hidden: false,
             selectable: true,
             min_width: px(20.0),
             max_width: px(f32::MAX),
@@ -183,6 +191,14 @@ impl Column {
     /// Set whether the column is movable, default is true.
     pub fn movable(mut self, movable: bool) -> Self {
         self.movable = movable;
+        self
+    }
+
+    /// Set whether the column is hidden, default is false.
+    ///
+    /// See [`Column::hidden`](Column#structfield.hidden).
+    pub fn hidden(mut self, hidden: bool) -> Self {
+        self.hidden = hidden;
         self
     }
 

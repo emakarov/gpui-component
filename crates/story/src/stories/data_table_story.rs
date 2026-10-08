@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     ops::Range,
     sync::LazyLock,
     time::{self, Duration},
@@ -15,7 +16,7 @@ use gpui_component::{
     ActiveTheme as _, Sizable as _, Size, StyleSized as _, StyledExt,
     button::Button,
     h_flex,
-    menu::PopupMenu,
+    menu::{PopupMenu, PopupMenuItem},
     spinner::Spinner,
     table::{
         Column, ColumnFixed, ColumnGroup, ColumnSort, DataTable, TableDelegate, TableEvent,
@@ -261,6 +262,9 @@ struct StockTableDelegate {
     columns: Vec<Column>,
     /// Number of extra "Column N" columns appended after the built-in columns.
     extra_columns_count: usize,
+    /// The hidden extra columns, by column index. The built-in columns keep
+    /// their own `Column::hidden`.
+    hidden_extra_columns: BTreeSet<usize>,
     size: Size,
     loading: bool,
     lazy_load: bool,
@@ -310,7 +314,8 @@ impl StockTableDelegate {
                 Column::new("volume", "Volume").p_0(),
                 Column::new("turnover", "Turnover").p_0(),
                 Column::new("market_cap", "Market Cap").p_0(),
-                Column::new("ttm", "TTM").p_0(),
+                // Hidden at start, show it from a header's context menu.
+                Column::new("ttm", "TTM").p_0().hidden(true),
                 Column::new("five_mins_ranking", "5m Ranking")
                     .text_right()
                     .p_0(),
@@ -357,6 +362,7 @@ impl StockTableDelegate {
                     .fixed(ColumnFixed::Right),
             ],
             extra_columns_count: 0,
+            hidden_extra_columns: BTreeSet::new(),
             loading: false,
             full_loading: false,
             show_group_headers: true,
@@ -453,6 +459,7 @@ impl TableDelegate for StockTableDelegate {
         } else {
             let n = col_ix + 2 - self.columns.len();
             Column::new(format!("extra_{n}"), format!("Column {n}"))
+                .hidden(self.hidden_extra_columns.contains(&col_ix))
         }
     }
 
@@ -533,6 +540,61 @@ impl TableDelegate for StockTableDelegate {
         .menu("Size Medium", Box::new(ChangeSize(Size::Medium)))
         .menu("Size Small", Box::new(ChangeSize(Size::Small)))
         .menu("Size XSmall", Box::new(ChangeSize(Size::XSmall)))
+    }
+
+    fn header_context_menu(
+        &mut self,
+        col_ix: usize,
+        menu: PopupMenu,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let name = self.column(col_ix, cx).name;
+        let table = cx.entity().downgrade();
+
+        // Move next to the previous (or next) visible column.
+        let move_item = |label: &'static str, forward: bool| {
+            let table = table.clone();
+            PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                _ = table.update(cx, |table, cx| {
+                    let visible = table.visible_columns();
+                    let Some(pos) = visible.iter().position(|&ix| ix == col_ix) else {
+                        return;
+                    };
+                    let target = if forward {
+                        visible.get(pos + 1)
+                    } else {
+                        pos.checked_sub(1).and_then(|pos| visible.get(pos))
+                    };
+                    if let Some(&to_ix) = target {
+                        // Refused moves (fixed regions, `can_move_column`)
+                        // return false and change nothing.
+                        table.move_column(col_ix, to_ix, window, cx);
+                    }
+                });
+            })
+        };
+
+        menu.label(name)
+            .item(PopupMenuItem::new("Hide Column").on_click({
+                let table = table.clone();
+                move |_, _, cx| {
+                    _ = table.update(cx, |table, cx| table.set_column_visible(col_ix, false, cx));
+                }
+            }))
+            .item(PopupMenuItem::new("Show All Columns").on_click({
+                let table = table.clone();
+                move |_, _, cx| {
+                    _ = table.update(cx, |table, cx| {
+                        for ix in 0..table.delegate().columns_count(cx) {
+                            table.set_column_visible(ix, true, cx);
+                        }
+                    });
+                }
+            }))
+            .separator()
+            .item(move_item("Move Left", false))
+            .item(move_item("Move Right", true))
     }
 
     fn render_tr(
@@ -662,6 +724,35 @@ impl TableDelegate for StockTableDelegate {
             "day_120_ranking" => stock.day_120_ranking.floor().to_string().into_any_element(),
             "day_250_ranking" => stock.day_250_ranking.floor().to_string().into_any_element(),
             _ => "--".to_string().into_any_element(),
+        }
+    }
+
+    /// The extra columns are not in `self.columns`, so they cannot move,
+    /// and the ID column stays first.
+    fn can_move_column(&self, col_ix: usize, to_ix: usize, _: &App) -> bool {
+        let is_id = |ix| {
+            self.column_ix(ix)
+                .is_some_and(|ix| self.columns[ix].key.as_ref() == "id")
+        };
+        self.column_ix(col_ix).is_some()
+            && self.column_ix(to_ix).is_some()
+            && !is_id(col_ix)
+            && !is_id(to_ix)
+    }
+
+    fn column_visibility_changed(
+        &mut self,
+        col_ix: usize,
+        visible: bool,
+        _: &mut Context<TableState<Self>>,
+    ) {
+        // Keep the visibility for `column`, which `TableState::refresh` reads.
+        if let Some(ix) = self.column_ix(col_ix) {
+            self.columns[ix].hidden = !visible;
+        } else if visible {
+            self.hidden_extra_columns.remove(&col_ix);
+        } else {
+            self.hidden_extra_columns.insert(col_ix);
         }
     }
 
@@ -1146,7 +1237,10 @@ impl Render for DataTableStory {
             }))
             .on_action(cx.listener(|this, action: &ChangeExtraColumns, _, cx| {
                 this.table.update(cx, |table, cx| {
-                    table.delegate_mut().extra_columns_count = action.0;
+                    let delegate = table.delegate_mut();
+                    delegate.extra_columns_count = action.0;
+                    // The extra column indices change with their count.
+                    delegate.hidden_extra_columns.clear();
                     table.refresh(cx);
                 });
                 cx.notify();
